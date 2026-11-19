@@ -1,4 +1,4 @@
 .env
 test-connect-raven.py
 test.py
-.pdf
+*.pdf
