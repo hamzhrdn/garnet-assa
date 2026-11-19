@@ -1,0 +1,11 @@
+services:
+  garnet:
+    image: ghcr.io/microsoft/garnet@sha256:a5b11ca8292400a6239437c34c96aaa515a55ab3613ef2e41a33914405f89442
+
+    ports:
+      - "127.0.0.1:6379:6379"
+
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
