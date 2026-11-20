@@ -39,6 +39,19 @@ def query_2(garnet, id_order):
     durasi_ms = (perf_counter() - mulai) * 1000
     return hasil, durasi_ms
 
+#query 5
+def query_5(garnet, id_order):
+    mulai = perf_counter()
+
+    pass
+
+#query 12
+#query 13
+#query 14
+#query 17
+#query 18
+#query 19
+
 def main(): 
     try:
         print("Koneksi:", garnet.ping())
@@ -55,6 +68,7 @@ def main():
         print(f"Waktu Eksekusi Query 2 : {waktu_garnet} ms" )
 
         #Test Query 5
+
     finally:
         garnet.close()
 

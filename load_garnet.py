@@ -255,6 +255,39 @@ def load_kendaraan(garnet, kendaraan):
     garnet.srem(key, no_polisi)
     return None
 
+#get data petugas
+def read_petugas(store, batch_size = 1000):
+    offset = 0
+    while True:
+        with store.open_session() as session:
+            documents = list(
+                session.advanced.raw_query(
+                    "from 'Petugas' order by id()",
+                    object_type=dict,
+                ).skip(offset).take(batch_size)
+            )
+        yield from documents
+        if len(documents) < batch_size:
+            break
+        offset += len(documents)
+
+#load data petugas
+def load_petugas(garnet, petugas):
+    id_petugas = petugas["id_petugas"].rsplit("/", 1)[-1]
+    nama = petugas["nama"]
+    status_kerja = petugas["status_kerja"]
+    if nama is None or status_kerja is None:
+        raise ValueError(f"Nama atau status_kerja petugas {id_petugas} null")
+    key = f"petugas:{id_petugas}"
+    garnet.hset(
+        key,
+        mapping={
+            "nama": nama,
+            "status_kerja": status_kerja,
+        },
+    )
+    return key
+
 def main():
     try:
         store.initialize()
@@ -262,6 +295,8 @@ def main():
         statistik_antar = defaultdict(Counter)
         statistik_sukses = defaultdict(Counter)
         total = 0
+        total_petugas = 0
+
         #handle data paket
         for paket in read_paket(store):
             key_paket = load_paket(garnet, paket)
@@ -322,26 +357,31 @@ def main():
             f"untuk tanggal {tanggal_acuan} dimuat."
         )
 
+        #load data kendaraan pada pool
         total_kendaraan = 0
         total_tersedia = 0
         contoh_pool = None
-
         for kendaraan in read_kendaraan(store):
             key_pool = load_kendaraan(garnet, kendaraan)
-
             total_kendaraan += 1
-
             if key_pool:
                 total_tersedia += 1
                 if contoh_pool is None:
                     contoh_pool = key_pool
-
-        print(f"Kendaraan diperiksa: {total_kendaraan}")
-        print(f"Kendaraan tersedia: {total_tersedia}")
-
+        print(f"Jumlah Kendaraan diperiksa: {total_kendaraan}")
+        print(f"Jumlah Kendaraan tersedia: {total_tersedia}")
         if contoh_pool:
             print("Contoh pool:", contoh_pool)
             print("Isi:", garnet.smembers(contoh_pool))
+
+        #load data petugas
+        for petugas in read_petugas(store):
+            key_petugas = load_petugas(garnet, petugas)
+            total_petugas += 1
+            if total_petugas == 1:
+                print("Contoh key petugas:", key_petugas)
+                print("Isi:", garnet.hgetall(key_petugas))
+        print(f"Total data load petugas : {total_petugas}")
             
     finally:
         store.close()

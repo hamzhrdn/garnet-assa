@@ -1,5 +1,7 @@
 from collections import defaultdict, Counter
 from datetime import date
+from math import isclose
+from time import perf_counter
 
 import load_garnet as loader
 
@@ -195,6 +197,122 @@ def sync(garnet, snapshot, dry_run=True):
 
     print(f"{label}: {berubah} key ditambah/diganti, \n {len(key_usang)} key dihapus.")
 
+def validate_data(garnet, snapshot):
+    key_aktual = set()
+    for pola in pola_key:
+        key_aktual.update(garnet.scan_iter(match=pola, count=500))
+    key_target = snapshot.keys
+    missing = key_target - key_aktual
+    over = key_aktual - key_target
+
+    prob = []
+    match_data = 0
+
+    for key in sorted(missing):
+        prob.append({
+            "key": key,
+            "error": "Key tidak ditemukan di garnet"
+        })
+
+    for key in sorted(over):
+        prob.append({
+            "key": key,
+            "error": "Key tidak ditemukan di raven"
+        })
+
+    group = (
+        ("hash", snapshot.hashes),
+        ("set", snapshot.sets),
+        ("zset", snapshot.ranks),
+    )
+
+    for type, cluster in group:
+        for key, target in cluster.items():
+            if key in missing:
+                continue
+            type_aktual = garnet.type(key)
+            if type_aktual != type:
+                prob.append({
+                    "key": key,
+                    "masalah": "Tipe berbeda",
+                    "target": type,
+                    "aktual": type_aktual,
+                })
+                continue
+            if type == 'hash':
+                aktual = garnet.hgetall(key)
+                sama = aktual == target
+            elif type == 'set':
+                aktual = garnet.smembers(key)
+                sama = aktual == target
+            else:
+                aktual = dict(garnet.zrange(key, 0, -1, withscores=True))
+
+                sama = (
+                    aktual.keys() == target.keys() and all(
+                        isclose(
+                            aktual[member],
+                            target[member],
+                            rel_tol = 0,
+                            abs_tol = 1e-9
+                        ) for member in target
+                    )
+                )
+            if sama:
+                match_data += 1
+                continue
+            if type == "set":
+                detail = {
+                    "anggota_kurang": sorted(target - aktual)[:5],
+                    "anggota_berlebih": sorted(aktual - target)[:5],
+                }
+            else:
+                berbeda = []
+
+                for field in sorted(set(target) | set(aktual)):
+                    if field not in target or field not in aktual:
+                        berbeda.append(field)
+                    elif type == "zset":
+                        if not isclose(
+                            aktual[field],
+                            target[field],
+                            rel_tol=0,
+                            abs_tol=1e-9,
+                        ):
+                            berbeda.append(field)
+                    elif aktual[field] != target[field]:
+                        berbeda.append(field)
+
+                detail = {
+                    field: {
+                        "target": target.get(field),
+                        "aktual": aktual.get(field),
+                    }
+                    for field in berbeda[:5]
+                }
+
+            prob.append({
+                "key": key,
+                "masalah": "Isi berbeda",
+                "detail": detail,
+            })
+
+    print("\nRingkasan validasi")
+    print("Key yang diharapkan:", len(key_target))
+    print("Key aktual:", len(key_aktual))
+    print("Key cocok:", match_data)
+    print("Key hilang:", len(missing))
+    print("Key berlebih:", len(over))
+    print("Total key bermasalah:", len(prob))
+
+    for item in prob[:20]:
+        print(item)
+
+    if len(prob) > 20:
+        print("Hanya 20 masalah pertama yang ditampilkan.")
+
+    return not prob
+
 def main():
     store = loader.store
     garnet = loader.garnet
@@ -202,8 +320,24 @@ def main():
     try:
         store.initialize()
         garnet.ping()
-        snapshot = buat_snapshot(store,tanggal_acuan=date(2026, 1, 1),)
-        sync(garnet,snapshot,dry_run=True,)
+
+        #read ravendb sesuai snapshot
+        print("Membaca RavenDB...", flush=True)
+        mulai = perf_counter()
+        snapshot = buat_snapshot(store, tanggal_acuan=date(2026, 1, 1), )
+        print(f"Snapshot selesai: {perf_counter() - mulai:.2f} detik", flush=True, )
+
+        #sync data
+        print("Sync Data RavenDB...", flush=True)
+        mulai = perf_counter()
+        sync(garnet, snapshot)
+        print(f"Sync Data selesai: {perf_counter() - mulai:.2f} detik", flush=True)
+
+        #validasi data
+        # print("Membandingkan Garnet...", flush=True)
+        # mulai = perf_counter()
+        # validate_data(garnet, snapshot)
+        # print(f"Validasi selesai: {perf_counter() - mulai:.2f} detik", flush=True )
 
     finally:
         store.close()
