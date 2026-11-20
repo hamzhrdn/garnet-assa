@@ -19,10 +19,8 @@ python --version
 
 ## 1. Clone repository
 
-Ganti URL berikut dengan URL repository GitHub kamu:
-
 ```sh
-git clone https://github.com/<username>/<repository>.git
+git clone https://github.com/hamzhrdn/garnet-assa.git
 cd <repository>
 ```
 
@@ -45,30 +43,10 @@ Garnet dapat diakses dari komputer lokal di `127.0.0.1:6379`. Konfigurasi ini ti
 **Windows PowerShell:**
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+create conda -n garnet-assa python==3.12
+conda activate garnet-assa
 python -m pip install -r requirements.txt
-Copy-Item .env.example .env
 ```
-
-Jika aktivasi virtual environment diblokir oleh PowerShell, gunakan executable Python-nya langsung, tanpa mengubah execution policy:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-Gunakan `.\.venv\Scripts\python.exe` sebagai pengganti `python` pada perintah selanjutnya jika environment tidak diaktifkan.
-
-**Linux / macOS:**
-
-```sh
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-cp .env.example .env
-```
-
-Salin `.env.example` hanya pada setup awal agar konfigurasi `.env` yang sudah ada tidak tertimpa.
 
 ## 4. Konfigurasi koneksi
 
@@ -82,8 +60,6 @@ Edit `.env` sesuai environment lokal:
 | `RAVEN_URL` | URL server RavenDB yang dapat diakses dari komputer tempat skrip Python dijalankan. |
 | `RAVEN_DATABASE` | Nama database RavenDB yang berisi data sumber. |
 | `RAVEN_CERT_PEM` | Path file sertifikat PEM jika RavenDB memerlukan sertifikat; kosongkan jika tidak digunakan. Pada Windows, path dapat ditulis seperti `C:/certs/client.pem`. |
-
-Nilai RavenDB di `.env.example` adalah contoh, bukan layanan yang otomatis dibuat. Sesuaikan dengan server dan database kamu. Sertifikat digunakan oleh `load_garnet.py` dan `sync.py`.
 
 ## 5. Uji koneksi Garnet
 
