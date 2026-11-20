@@ -1,4 +1,14 @@
 .env
+.env.*
+!.env.example
+.venv/
+venv/
+*.pem
+*.key
+*.pfx
+*.p12
 test-connect-raven.py
 test.py
 *.pdf
+__pycache__/
+*.py[cod]

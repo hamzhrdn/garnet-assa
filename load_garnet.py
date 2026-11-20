@@ -1,266 +1,351 @@
-"""Rebuild data turunan Garnet dari RavenDB (desain bagian 3 dan 5).
-
-Jalankan saat penulisan aplikasi dihentikan: pembacaan lintas halaman dan
-penggantian lintas key bukan satu transaksi. Jika gagal saat menulis, jalankan
-ulang. Hanya pola key desain di MANAGED_PATTERNS yang diganti/dibersihkan.
-"""
-
-import argparse
-from collections import Counter, defaultdict
+from dotenv import load_dotenv
+from ravendb import DocumentStore
 from datetime import date, datetime
+from collections import defaultdict, Counter
+
+import redis
 import os
-from pathlib import Path
-import sys
 
+load_dotenv()
 
-MANAGED_PATTERNS = (
-    "paket:*", "order:*:resi", "lokasi:*:*", "tarif:*:*:*",
-    "kurir:*:antar", "kurir:*:sukses", "rank:kurir:*",
-    "pool:*:kendaraan_tersedia",
+#koneksi garnet
+garnet = redis.Redis(
+    host=os.getenv("GARNET_HOST", "127.0.0.1"),
+    port=int(os.getenv("GARNET_PORT", "6379")),
+    password=os.getenv("GARNET_PASSWORD") or None,
+    decode_responses=True,
+    socket_connect_timeout=5,
+    socket_timeout=5,
 )
 
+#koneksi ravendb
+store = DocumentStore(
+    urls=[os.environ["RAVEN_URL"]],
+    database=os.environ["RAVEN_DATABASE"],
+)
+certificate = os.getenv("RAVEN_CERT_PEM", "").strip()
+if certificate:
+    store.certificate_pem_path = certificate
 
-def required(document, field):
-    value = document.get(field)
-    if value is None or value == "":
-        raise ValueError(f"Field wajib kosong: {field}")
-    return value
-
-
-def identifier(value):
-    """Referensi RavenDB menjadi PK asli; jangan ubah kapitalisasi PK."""
-    if value is None or value == "":
-        return ""
-    return str(value).rsplit("/", 1)[-1]
-
-
-def day(value):
-    return date.fromisoformat(str(value)[:10])
-
-
-class Snapshot:
-    def __init__(self, as_of):
-        self.as_of = as_of
-        self.hashes = {}
-        self.sets = defaultdict(set)
-        self.ranks = {}
-        self.attempts = defaultdict(Counter)
-        self.successes = defaultdict(Counter)
-        self.tariff_versions = {}
-        self.counts = Counter()
-
-    def add_package(self, doc):
-        resi = identifier(required(doc, "no_resi"))
-        key = f"paket:{resi}"
-        if key in self.hashes:
-            raise ValueError(f"Resi duplikat: {resi}")
-        events = doc.get("events") or []
-        sequences = [int(required(event, "urutan_event")) for event in events]
-        if any(n < 1 for n in sequences) or len(set(sequences)) != len(sequences):
-            raise ValueError(f"Urutan event tidak valid: {resi}")
-        latest = max(events, key=lambda e: int(e["urutan_event"])) if events else {}
-        status = doc.get("status_terkini") or latest.get("status_pengiriman")
-        if not status:
-            raise ValueError(f"Status terkini kosong: {resi}")
-        if latest and status != required(latest, "status_pengiriman"):
-            raise ValueError(f"Status terkini berbeda dari event terakhir: {resi}")
-        location = identifier(doc.get("id_lokasi_terkini", latest.get("id_lokasi")))
-        self.hashes[key] = {
-            "status": status,
-            "urutan": max(sequences, default=0),
-            "waktu": latest.get("waktu_event") or "",
-            "id_lokasi": location,
-            "id_kurir": identifier(latest.get("id_kurir")),
-        }
-        order = identifier(required(required(doc, "order"), "id_order"))
-        self.sets[f"order:{order}:resi"].add(resi)
-        if location:
-            self.sets[f"lokasi:{location}:{status}"].add(resi)
-        for event in events:
-            event_status = required(event, "status_pengiriman")
-            courier = identifier(event.get("id_kurir"))
-            if event_status not in ("DITERIMA", "GAGAL_ANTAR"):
-                continue
-            if not courier:
-                raise ValueError(f"Event upaya antar tanpa id_kurir: {resi}")
-            timestamp = datetime.fromisoformat(required(event, "waktu_event"))
-            month = timestamp.strftime("%Y%m")
-            self.attempts[month][courier] += 1
-            if event_status == "DITERIMA":
-                self.successes[month][courier] += 1
-
-    def add_tariff(self, doc):
-        start = day(required(doc, "berlaku_mulai"))
-        end = day(doc["berlaku_sampai"]) if doc.get("berlaku_sampai") else None
-        if end is not None and end < start:
-            raise ValueError("Rentang berlaku tarif tidak valid")
-        if start > self.as_of or (end is not None and end < self.as_of):
-            return
-        service = required(doc, "jenis_layanan")
-        origin = required(required(doc, "wilayah_asal"), "kode_wilayah")
-        destination = required(required(doc, "wilayah_tujuan"), "kode_wilayah")
-        key = f"tarif:{service}:{origin}:{destination}"
-        tariff_id = identifier(required(doc, "id_tarif"))
-        # Bila versi aktif bertumpuk, gunakan tanggal mulai paling baru.
-        version = (start, tariff_id)
-        if key in self.tariff_versions and version <= self.tariff_versions[key]:
-            return
-        self.tariff_versions[key] = version
-        self.hashes[key] = {
-            "id_tarif": tariff_id,
-            "harga_per_kg": required(doc, "harga_per_kg"),
-            "estimasi_waktu": required(doc, "estimasi_waktu"),
-        }
-
-    def add_vehicle(self, doc):
-        if required(doc, "status_kendaraan") == "TERSEDIA":
-            pool = identifier(required(doc, "id_lokasi_basis"))
-            self.sets[f"pool:{pool}:kendaraan_tersedia"].add(
-                identifier(required(doc, "no_polisi"))
+#get data paket dari ravendb
+def read_paket(store, batch_size = 1000, limit = None):
+    offset = 0
+    while limit is None or offset < limit:
+        jumlah = batch_size
+        if limit is not None:
+            jumlah = min(batch_size, limit - offset)
+        with store.open_session() as session:
+            documents = list(
+                session.advanced.raw_query(
+                    "from 'Paket' order by id()",
+                    object_type = dict
+                ).skip(offset).take(jumlah)
             )
+        if not documents:
+            break
+        yield from documents
+        offset += len(documents)
+        if len(documents) < jumlah:
+            break
 
-    def finish(self):
-        quarterly_attempts = defaultdict(Counter)
-        quarterly_successes = defaultdict(Counter)
-        for month, attempts in self.attempts.items():
-            successes = {courier: self.successes[month][courier] for courier in attempts}
-            self.hashes[f"kurir:{month}:antar"] = dict(attempts)
-            self.hashes[f"kurir:{month}:sukses"] = successes
-            self.ranks[f"rank:kurir:{month}"] = {
-                courier: 100 * successes[courier] / count
-                for courier, count in attempts.items()
-            }
-            quarter = f"{month[:4]}Q{(int(month[4:]) - 1) // 3 + 1}"
-            quarterly_attempts[quarter].update(attempts)
-            quarterly_successes[quarter].update(successes)
-        for quarter, attempts in quarterly_attempts.items():
-            self.ranks[f"rank:kurir:{quarter}"] = {
-                courier: 100 * quarterly_successes[quarter][courier] / count
-                for courier, count in attempts.items()
-            }
+#write data paket ke garnet
+def load_paket(garnet, paket):
+    events = paket.get("events") or []
+    event_terakhir = max(events, key=lambda event: int(event["urutan_event"]), default={} )
+    status = (paket.get("status_terkini") or event_terakhir.get("status_pengiriman"))
+    if not status:
+        raise ValueError(f"Status paket {paket['no_resi']} tidak tersedia")
+    id_lokasi = paket.get("id_lokasi_terkini", event_terakhir.get("id_lokasi"),)
+    id_kurir = event_terakhir.get("id_kurir")
 
-    @property
-    def keys(self):
-        return set(self.hashes) | set(self.sets) | set(self.ranks)
+    id_lokasi = id_lokasi.rsplit("/", 1)[-1] if id_lokasi else ""
+    id_kurir = id_kurir.rsplit("/", 1)[-1] if id_kurir else ""
 
+    key = f"paket:{paket['no_resi']}"
+    garnet.hset(
+        key,
+        mapping = {
+            "status": status,
+            "urutan": int(event_terakhir.get("urutan_event", 0)),
+            "waktu": event_terakhir.get("waktu_event") or "",
+            "id_lokasi": id_lokasi,
+            "id_kurir": id_kurir,
+        }        
+    )
+    return key
 
-def read_collection(store, collection, batch_size):
+#write data resi 1 order
+def load_resi_order(garnet, paket):
+    referensi_order = paket['order']['id_order']
+    id_order = referensi_order.rsplit("/", 1)[-1]
+    key = f"order:{id_order}:resi"
+    garnet.sadd(key, paket['no_resi'])
+    return key
+
+#write lokasi resi
+def load_lokasi_resi(garnet, paket):
+    id_lokasi = paket.get("id_lokasi_terkini")
+    status = paket.get("status_terkini")
+
+    if not id_lokasi:
+        return None
+
+    if not status:
+        raise ValueError(f"Status paket {paket['no_resi']} tidak tersedia")
+
+    id_lokasi = id_lokasi.rsplit("/", 1)[-1]
+    key = f"lokasi:{id_lokasi}:{status}"
+    garnet.sadd(key, paket['no_resi'])
+    return key
+
+#get data tarif dari ravendb
+def read_tarif(store, batch_size = 1000):
     offset = 0
     while True:
-        # Session baru per halaman menghindari limit request dan tracking membesar.
         with store.open_session() as session:
-            page = list(session.advanced.raw_query(
-                f"from '{collection}' order by id()", object_type=dict
-            ).skip(offset).take(batch_size))
-        yield from page
-        if len(page) < batch_size:
+            documents = list(
+                session.advanced.raw_query(
+                    "from 'Tarif' order by id()",
+                    object_type = dict
+                ).skip(offset).take(batch_size)
+            )
+        yield from documents
+        offset += len(documents)
+        if len(documents) < batch_size:
             break
-        offset += len(page)
 
+#cek tarif aktif
+def tarif_aktif(tarif, tanggal):
+    mulai = date.fromisoformat(tarif["berlaku_mulai"][:10])
+    sampai = tarif.get("berlaku_sampai")
+    if sampai: 
+        sampai = date.fromisoformat(sampai[:10])
+    return (mulai <= tanggal and (sampai is None or tanggal <= sampai))
 
-def write_snapshot(client, snapshot, batch_size):
-    # Ambil daftar lama sebelum mutasi: SCAN sambil DEL dapat melewatkan key.
-    old_keys = set()
-    for pattern in MANAGED_PATTERNS:
-        old_keys.update(client.scan_iter(match=pattern, count=batch_size))
-    with client.pipeline(transaction=False) as pipe:
-        pending = 0
+#write data ke garnet:
+def load_tarif(garnet, tarif):
+    layanan = tarif["jenis_layanan"]
+    asal = tarif["wilayah_asal"]["kode_wilayah"]
+    tujuan = tarif["wilayah_tujuan"]["kode_wilayah"]
 
-        def flush():
-            nonlocal pending
-            pipe.execute()
-            pending = 0
+    key = f"tarif:{layanan}:{asal}:{tujuan}"
 
-        for kind, entries in (
-            ("hash", snapshot.hashes), ("set", snapshot.sets), ("zset", snapshot.ranks)
-        ):
-            for key, values in entries.items():
-                pipe.delete(key)
-                pending += 1
-                items = list(values.items()) if kind != "set" else sorted(values)
-                for start in range(0, len(items), batch_size):
-                    chunk = items[start:start + batch_size]
-                    if kind == "hash":
-                        pipe.hset(key, mapping=dict(chunk))
-                    elif kind == "set":
-                        pipe.sadd(key, *chunk)
-                    else:
-                        pipe.zadd(key, dict(chunk))
-                    pending += 1
-                    if pending >= batch_size:
-                        flush()
-        if pending:
-            flush()
-        stale = sorted(old_keys - snapshot.keys)
-        for start in range(0, len(stale), batch_size):
-            client.delete(*stale[start:start + batch_size])
-    return len(stale)
+    garnet.hset(
+        key,
+        mapping={
+            "id_tarif" : tarif["id_tarif"].rsplit("/", 1)[-1],
+            "harga_per_kg" : tarif["harga_per_kg"],
+            "estimasi_waktu" : tarif["estimasi_waktu"],
+        },
+    )
 
+    return key
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--as-of", type=date.fromisoformat, default=date(2026, 1, 1),
-                        help="Tanggal tarif aktif, YYYY-MM-DD (default: 2026-01-01)")
-    parser.add_argument("--batch-size", type=int, default=1000)
-    parser.add_argument("--dry-run", action="store_true", help="Baca dan validasi tanpa menulis Garnet")
-    args = parser.parse_args(argv)
-    if args.batch_size < 1:
-        parser.error("--batch-size harus positif")
-    try:
-        from dotenv import load_dotenv
-        from ravendb import DocumentStore
-        load_dotenv(Path(__file__).with_name(".env"))
-        url = os.environ["RAVEN_URL"]
-        database = os.environ["RAVEN_DATABASE"]
-        snapshot = Snapshot(args.as_of)
-        store = DocumentStore(urls=[url], database=database)
-        certificate = os.getenv("RAVEN_CERT_PEM", "").strip()
-        if certificate:
-            store.certificate_pem_path = str(Path(certificate).resolve())
-        try:
-            store.initialize()
-            for collection, consume in (
-                ("Paket", snapshot.add_package),
-                ("Tarif", snapshot.add_tariff),
-                ("Kendaraan", snapshot.add_vehicle),
-            ):
-                for document in read_collection(store, collection, args.batch_size):
-                    try:
-                        consume(document)
-                    except (ValueError, TypeError, KeyError) as error:
-                        doc_id = document.get("@metadata", {}).get("@id", "ID tidak tersedia")
-                        raise ValueError(f"{collection} ({doc_id}): {error}") from error
-                    snapshot.counts[collection] += 1
-                print(f"[OK] {collection}: {snapshot.counts[collection]:,} dokumen", flush=True)
-        finally:
-            store.close()
-        snapshot.finish()
-        print(f"[OK] Rencana: {len(snapshot.hashes):,} hash, "
-              f"{len(snapshot.sets):,} set, {len(snapshot.ranks):,} sorted set; "
-              f"tanggal tarif {args.as_of}")
-        if args.dry_run:
-            print("[DRY RUN] Garnet tidak diubah.")
-            return 0
-        if not snapshot.counts["Paket"] or not snapshot.counts["Tarif"] or not snapshot.counts["Kendaraan"]:
-            raise ValueError("Collection sumber kosong; rebuild dibatalkan. Periksa database dan nama collection.")
-        import redis
-        client = redis.Redis(
-            host=os.getenv("GARNET_HOST", "127.0.0.1"),
-            port=int(os.getenv("GARNET_PORT", "6379")),
-            password=os.getenv("GARNET_PASSWORD") or None,
-            decode_responses=True, socket_connect_timeout=5, socket_timeout=30,
+#statistik kurir
+def hitung_statistik_kurir(paket, statistik_antar, statistik_sukses):
+    for event in paket.get("events") or []:
+        status = event["status_pengiriman"]
+
+        if status not in ("DITERIMA", "GAGAL_ANTAR"):
+            continue
+
+        referensi_kurir = event.get("id_kurir")
+
+        if not referensi_kurir:
+            raise ValueError(
+                f"Event {status} pada paket "
+                f"{paket['no_resi']} tidak memiliki id_kurir"
+            )
+
+        id_kurir = referensi_kurir.rsplit("/", 1)[-1]
+
+        waktu = datetime.fromisoformat(event["waktu_event"])
+        bulan = waktu.strftime("%Y%m")
+
+        statistik_antar[bulan][id_kurir] += 1
+
+        if status == "DITERIMA":
+            statistik_sukses[bulan][id_kurir] += 1
+
+#write statistik kurir
+def load_statistik_kurir(garnet, statistik_antar, statistik_sukses):
+    for bulan, jumlah_antar in statistik_antar.items():
+        key_antar = f"kurir:{bulan}:antar"
+        key_sukses = f"kurir:{bulan}:sukses"
+
+        # Kurir tanpa keberhasilan tetap memiliki nilai sukses 0.
+        jumlah_sukses = {
+            id_kurir: statistik_sukses[bulan][id_kurir]
+            for id_kurir in jumlah_antar
+        }
+
+        # Ganti isi bulan ini agar tidak meninggalkan field kurir lama.
+        garnet.delete(key_antar, key_sukses)
+
+        garnet.hset(key_antar, mapping=dict(jumlah_antar))
+        garnet.hset(key_sukses, mapping=jumlah_sukses)
+
+        print(f"Statistik {bulan}: {len(jumlah_antar)} kurir")
+
+#write rank kurir
+def load_rank_kurir(garnet, statistik_antar, statistik_sukses):
+    antar_periode = defaultdict(Counter)
+    sukses_periode = defaultdict(Counter)
+
+    for bulan, jumlah_antar in statistik_antar.items():
+        #kuartal
+        tahun = bulan[:4]
+        nomor_bulan = int(bulan[4:6])
+        kuartal = (nomor_bulan - 1) // 3 + 1
+        periode = f"{tahun}Q{kuartal}"
+        antar_periode[periode].update(jumlah_antar)
+        sukses_periode[periode].update(
+            statistik_sukses.get(bulan, {})
         )
-        try:
-            client.ping()
-            removed = write_snapshot(client, snapshot, args.batch_size)
-            print(f"[OK] {len(snapshot.keys):,} key dimuat; {removed:,} key usang dihapus.")
-        finally:
-            client.close()
-        return 0
-    except Exception as error:
-        print(f"[GAGAL] {error}", file=sys.stderr)
-        return 1
+    for periode, jumlah_antar in antar_periode.items():
+        skor = {}
+        for id_kurir, total_antar in jumlah_antar.items():
+            if total_antar <= 0:
+                continue
+            total_sukses = sukses_periode[periode][id_kurir]
+            skor[id_kurir] = (total_sukses / total_antar * 100)
 
+        key = f"rank:kurir:{periode}"
+        # hapus ranking lama agar kurir yang sudah tidak ada ikut hilang.
+        garnet.delete(key)
+        if skor:
+            garnet.zadd(key, mapping=skor)
+        print(f"Ranking {periode}: {len(skor)} kurir")
+
+#get data kendaraan
+def read_kendaraan(store, batch_size=500):
+    offset = 0
+
+    while True:
+        with store.open_session() as session:
+            documents = list(
+                session.advanced.raw_query(
+                    "from 'Kendaraan' order by id()",
+                    object_type=dict,
+                ).skip(offset).take(batch_size)
+            )
+
+        yield from documents
+
+        if len(documents) < batch_size:
+            break
+
+        offset += len(documents)
+
+#write data kendaraan
+def load_kendaraan(garnet, kendaraan):
+    id_lokasi = kendaraan["id_lokasi_basis"]
+
+    if not id_lokasi:
+        raise ValueError(f"Lokasi basis kendaraan {kendaraan['no_polisi']} kosong")
+
+    id_lokasi = id_lokasi.rsplit("/", 1)[-1]
+    key = f"pool:{id_lokasi}:kendaraan_tersedia"
+    no_polisi = kendaraan["no_polisi"]
+
+    if kendaraan["status_kendaraan"] == "TERSEDIA":
+        garnet.sadd(key, no_polisi)
+        return key
+
+    garnet.srem(key, no_polisi)
+    return None
+
+def main():
+    try:
+        store.initialize()
+        garnet.ping()
+        statistik_antar = defaultdict(Counter)
+        statistik_sukses = defaultdict(Counter)
+        total = 0
+        #handle data paket
+        for paket in read_paket(store):
+            key_paket = load_paket(garnet, paket)
+            key_order = load_resi_order(garnet, paket)
+            key_lokasi = load_lokasi_resi(garnet, paket)
+            hitung_statistik_kurir(paket,statistik_antar,statistik_sukses,)
+            total += 1
+
+            # print satu paket pertama
+            if total == 1:
+                print("Paket:", key_paket)
+                print("Order:", key_order)
+
+                if key_lokasi:
+                    print("Lokasi:", key_lokasi)
+                    print("Daftar resi:", garnet.smembers(key_lokasi))
+                else:
+                    print("Paket ini tidak memiliki lokasi terkini.")
+
+            if total % 500 == 0:
+                print(f"Sudah dimuat: {total} paket")
+
+        load_statistik_kurir(garnet,statistik_antar,statistik_sukses,)
+        load_rank_kurir(garnet,statistik_antar,statistik_sukses,)
+
+        tanggal_acuan = date(2026, 1, 1)
+        tarif_terpilih = {}
+
+        for tarif in read_tarif(store):
+            if not tarif_aktif(tarif, tanggal_acuan):
+                continue
+
+            rute = (
+                tarif["jenis_layanan"],
+                tarif["wilayah_asal"]["kode_wilayah"],
+                tarif["wilayah_tujuan"]["kode_wilayah"],
+            )
+
+            versi = (
+                date.fromisoformat(tarif["berlaku_mulai"][:10]),
+                tarif["id_tarif"],
+            )
+
+            sebelumnya = tarif_terpilih.get(rute)
+
+            if sebelumnya is None or versi > sebelumnya[0]:
+                tarif_terpilih[rute] = (versi, tarif)
+
+        for nomor, (_, tarif) in enumerate(tarif_terpilih.values(), start=1):
+            key_tarif = load_tarif(garnet, tarif)
+
+            if nomor == 1:
+                print("Contoh key tarif:", key_tarif)
+                print("Isi:", garnet.hgetall(key_tarif))
+
+        print(
+            f"Selesai: {len(tarif_terpilih)} tarif aktif "
+            f"untuk tanggal {tanggal_acuan} dimuat."
+        )
+
+        total_kendaraan = 0
+        total_tersedia = 0
+        contoh_pool = None
+
+        for kendaraan in read_kendaraan(store):
+            key_pool = load_kendaraan(garnet, kendaraan)
+
+            total_kendaraan += 1
+
+            if key_pool:
+                total_tersedia += 1
+                if contoh_pool is None:
+                    contoh_pool = key_pool
+
+        print(f"Kendaraan diperiksa: {total_kendaraan}")
+        print(f"Kendaraan tersedia: {total_tersedia}")
+
+        if contoh_pool:
+            print("Contoh pool:", contoh_pool)
+            print("Isi:", garnet.smembers(contoh_pool))
+            
+    finally:
+        store.close()
+        garnet.close()
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
