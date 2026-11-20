@@ -81,17 +81,7 @@ python load_garnet.py
 
 Skrip membaca collection `Paket`, `Tarif`, dan `Kendaraan`, lalu mengisi data paket, daftar resi per order/lokasi, tarif, statistik dan ranking kurir, serta kendaraan tersedia. Struktur dokumen harus sesuai field yang diakses dalam `load_garnet.py`; repository ini tidak menyediakan seed data RavenDB.
 
-Tanggal acuan tarif saat ini ditetapkan ke **1 Januari 2026** di `load_garnet.py` dan `sync.py`. Ubah keduanya jika membutuhkan tanggal acuan lain.
-
-Loader menulis ke Garnet, tetapi tidak membersihkan seluruh data lama. Untuk melihat perubahan yang diperlukan agar cache sesuai sumber, jalankan:
-
-```sh
-python sync.py
-```
-
-Secara default, `sync.py` memakai `dry_run=True`: membaca sumber dan cache, lalu menampilkan jumlah key yang akan ditambah/diganti dan dihapus tanpa menulis perubahan. Skrip menolak sinkronisasi jika salah satu collection sumber kosong.
-
-Untuk menerapkan sinkronisasi, ubah argumen pemanggilan `sync()` di `main()` menjadi `dry_run=False`, lalu jalankan kembali. Mode ini mengganti key yang berbeda dan menghapus key usang sesuai pola pada `pola_key`; gunakan instance Garnet khusus proyek ini. Sinkronisasi berjalan sekali per eksekusi, bukan otomatis di latar belakang.
+Loader menulis ke Garnet, tetapi tidak membersihkan seluruh data lama.
 
 ## 7. Jalankan contoh query
 
@@ -134,29 +124,5 @@ Setelah server dimulai ulang, muat kembali cache dari RavenDB bila diperlukan.
 └── README.md
 ```
 
-## Troubleshooting
-
-| Masalah | Pemeriksaan |
-| --- | --- |
-| Docker tidak dapat terhubung ke daemon | Pastikan Docker Desktop / Docker Engine berjalan. |
-| Port `6379` sudah digunakan | Hentikan layanan yang memakai port tersebut atau ubah mapping menjadi `127.0.0.1:6380:6379` di `compose.yml` dan isi `GARNET_PORT=6380` pada `.env`. |
-| Koneksi Garnet ditolak | Periksa `docker compose ps`, log service, serta host dan port pada `.env`. |
-| `KeyError: 'RAVEN_URL'` / `'RAVEN_DATABASE'` | Pastikan `.env` tersedia dan kedua variabel sudah diisi. |
-| RavenDB menolak koneksi | Periksa URL, nama database, akses jaringan, serta path dan izin sertifikat jika diperlukan. |
-| Query tidak mengembalikan paket | Jalankan loader dan pilih ID order yang ada pada data sumber. |
-| Instalasi dependency gagal | Periksa pesan `pip`, versi Python, dan ketersediaan versi paket dalam `requirements.txt` pada package index yang digunakan. |
-
-## Sebelum push ke GitHub
-
-`.env`, virtual environment, cache Python, dan file sertifikat dikecualikan melalui `.gitignore`. Commit `.env.example` sebagai template konfigurasi; jangan isi template dengan kredensial asli.
-
-Periksa isi perubahan sebelum commit:
-
-```sh
-git status --short
-git diff
-git diff --cached
-git ls-files
-```
 
 Aturan `.gitignore` tidak berlaku surut pada file yang sudah dilacak. Jika PDF atau file lokal lain masih muncul pada `git ls-files` dan tidak ingin dipublikasikan, keluarkan dari index dengan `git rm --cached <nama-file>` sebelum commit. Perintah ini mempertahankan file lokal; file yang pernah di-commit tetap ada dalam riwayat Git.
