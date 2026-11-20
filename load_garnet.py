@@ -2,9 +2,11 @@ from dotenv import load_dotenv
 from ravendb import DocumentStore
 from datetime import date, datetime
 from collections import defaultdict, Counter
+from time import perf_counter
 
 import redis
 import os
+import json
 
 load_dotenv()
 
@@ -172,26 +174,20 @@ def load_statistik_kurir(garnet, statistik_antar, statistik_sukses):
     for bulan, jumlah_antar in statistik_antar.items():
         key_antar = f"kurir:{bulan}:antar"
         key_sukses = f"kurir:{bulan}:sukses"
-
         # Kurir tanpa keberhasilan tetap memiliki nilai sukses 0.
         jumlah_sukses = {
             id_kurir: statistik_sukses[bulan][id_kurir]
             for id_kurir in jumlah_antar
         }
-
         # Ganti isi bulan ini agar tidak meninggalkan field kurir lama.
         garnet.delete(key_antar, key_sukses)
-
         garnet.hset(key_antar, mapping=dict(jumlah_antar))
         garnet.hset(key_sukses, mapping=jumlah_sukses)
-
-        print(f"Statistik {bulan}: {len(jumlah_antar)} kurir")
 
 #write rank kurir
 def load_rank_kurir(garnet, statistik_antar, statistik_sukses):
     antar_periode = defaultdict(Counter)
     sukses_periode = defaultdict(Counter)
-
     for bulan, jumlah_antar in statistik_antar.items():
         #kuartal
         tahun = bulan[:4]
@@ -199,9 +195,7 @@ def load_rank_kurir(garnet, statistik_antar, statistik_sukses):
         kuartal = (nomor_bulan - 1) // 3 + 1
         periode = f"{tahun}Q{kuartal}"
         antar_periode[periode].update(jumlah_antar)
-        sukses_periode[periode].update(
-            statistik_sukses.get(bulan, {})
-        )
+        sukses_periode[periode].update(statistik_sukses.get(bulan, {}))
     for periode, jumlah_antar in antar_periode.items():
         skor = {}
         for id_kurir, total_antar in jumlah_antar.items():
@@ -215,10 +209,9 @@ def load_rank_kurir(garnet, statistik_antar, statistik_sukses):
         garnet.delete(key)
         if skor:
             garnet.zadd(key, mapping=skor)
-        print(f"Ranking {periode}: {len(skor)} kurir")
 
 #get data kendaraan
-def read_kendaraan(store, batch_size=500):
+def read_kendaraan(store, batch_size=1000):
     offset = 0
 
     while True:
@@ -255,112 +248,66 @@ def load_kendaraan(garnet, kendaraan):
     garnet.srem(key, no_polisi)
     return None
 
-#get data petugas
-def read_petugas(store, batch_size = 1000):
-    offset = 0
-    while True:
-        with store.open_session() as session:
-            documents = list(
-                session.advanced.raw_query(
-                    "from 'Petugas' order by id()",
-                    object_type=dict,
-                ).skip(offset).take(batch_size)
-            )
-        yield from documents
-        if len(documents) < batch_size:
-            break
-        offset += len(documents)
-
-#load data petugas
-def load_petugas(garnet, petugas):
-    id_petugas = petugas["id_petugas"].rsplit("/", 1)[-1]
-    nama = petugas["nama"]
-    status_kerja = petugas["status_kerja"]
-    if nama is None or status_kerja is None:
-        raise ValueError(f"Nama atau status_kerja petugas {id_petugas} null")
-    key = f"petugas:{id_petugas}"
-    garnet.hset(
-        key,
-        mapping={
-            "nama": nama,
-            "status_kerja": status_kerja,
-        },
-    )
-    return key
-
 def main():
     try:
         store.initialize()
         garnet.ping()
         statistik_antar = defaultdict(Counter)
         statistik_sukses = defaultdict(Counter)
-        total = 0
-        total_petugas = 0
+        total_paket = 0
 
         #handle data paket
+        start_load_paket = perf_counter()
         for paket in read_paket(store):
-            key_paket = load_paket(garnet, paket)
-            key_order = load_resi_order(garnet, paket)
-            key_lokasi = load_lokasi_resi(garnet, paket)
-            hitung_statistik_kurir(paket,statistik_antar,statistik_sukses,)
-            total += 1
+            load_paket(garnet, paket)
+            load_resi_order(garnet, paket)
+            load_lokasi_resi(garnet, paket)
+            hitung_statistik_kurir(paket, statistik_antar, statistik_sukses, )
+            total_paket += 1
 
-            # print satu paket pertama
-            if total == 1:
-                print("Paket:", key_paket)
-                print("Order:", key_order)
+        end_load_paket = perf_counter() - start_load_paket 
+        print(f"waktu load data paket : {end_load_paket} s, total data paket : {total_paket}")
 
-                if key_lokasi:
-                    print("Lokasi:", key_lokasi)
-                    print("Daftar resi:", garnet.smembers(key_lokasi))
-                else:
-                    print("Paket ini tidak memiliki lokasi terkini.")
-
-            if total % 500 == 0:
-                print(f"Sudah dimuat: {total} paket")
-
+        #handle statistik kurir
+        start_load_statistik_kurir = perf_counter()
         load_statistik_kurir(garnet,statistik_antar,statistik_sukses,)
-        load_rank_kurir(garnet,statistik_antar,statistik_sukses,)
+        end_load_statistik_kurir = perf_counter() - start_load_statistik_kurir 
+        print(f"waktu load data statistik : {end_load_statistik_kurir} s")
 
+        #handle rank kurir
+        start_load_rank_kurir = perf_counter()
+        load_rank_kurir(garnet,statistik_antar,statistik_sukses,)
+        end_load_rank_kurir = perf_counter() - start_load_rank_kurir 
+        print(f"waktu load rank statistik : {end_load_rank_kurir} s")
+
+        #load data tarif
+        start_load_tarif = perf_counter()
         tanggal_acuan = date(2026, 1, 1)
         tarif_terpilih = {}
 
         for tarif in read_tarif(store):
             if not tarif_aktif(tarif, tanggal_acuan):
                 continue
-
             rute = (
                 tarif["jenis_layanan"],
                 tarif["wilayah_asal"]["kode_wilayah"],
                 tarif["wilayah_tujuan"]["kode_wilayah"],
             )
-
-            versi = (
-                date.fromisoformat(tarif["berlaku_mulai"][:10]),
-                tarif["id_tarif"],
-            )
-
+            versi = (date.fromisoformat(tarif["berlaku_mulai"][:10]), tarif["id_tarif"], )
             sebelumnya = tarif_terpilih.get(rute)
-
             if sebelumnya is None or versi > sebelumnya[0]:
                 tarif_terpilih[rute] = (versi, tarif)
-
-        for nomor, (_, tarif) in enumerate(tarif_terpilih.values(), start=1):
-            key_tarif = load_tarif(garnet, tarif)
-
-            if nomor == 1:
-                print("Contoh key tarif:", key_tarif)
-                print("Isi:", garnet.hgetall(key_tarif))
-
+        end_load_tarif = perf_counter() - start_load_tarif
         print(
-            f"Selesai: {len(tarif_terpilih)} tarif aktif "
-            f"untuk tanggal {tanggal_acuan} dimuat."
+            f"\nSelesai: {len(tarif_terpilih)} tarif aktif untuk tanggal {tanggal_acuan} dimuat."
+            f"\nWaktu load data {end_load_tarif} s"
         )
 
         #load data kendaraan pada pool
         total_kendaraan = 0
         total_tersedia = 0
         contoh_pool = None
+        start_load_kendaraan = perf_counter()
         for kendaraan in read_kendaraan(store):
             key_pool = load_kendaraan(garnet, kendaraan)
             total_kendaraan += 1
@@ -368,20 +315,10 @@ def main():
                 total_tersedia += 1
                 if contoh_pool is None:
                     contoh_pool = key_pool
-        print(f"Jumlah Kendaraan diperiksa: {total_kendaraan}")
+        print(f"\nJumlah Kendaraan diperiksa: {total_kendaraan}")
         print(f"Jumlah Kendaraan tersedia: {total_tersedia}")
-        if contoh_pool:
-            print("Contoh pool:", contoh_pool)
-            print("Isi:", garnet.smembers(contoh_pool))
-
-        #load data petugas
-        for petugas in read_petugas(store):
-            key_petugas = load_petugas(garnet, petugas)
-            total_petugas += 1
-            if total_petugas == 1:
-                print("Contoh key petugas:", key_petugas)
-                print("Isi:", garnet.hgetall(key_petugas))
-        print(f"Total data load petugas : {total_petugas}")
+        end_load_kendaraan = perf_counter() - start_load_kendaraan
+        print(f"Waktu load Data kendaraan {end_load_kendaraan} s")
             
     finally:
         store.close()

@@ -12,3 +12,4 @@ test.py
 *.pdf
 __pycache__/
 *.py[cod]
+query.md

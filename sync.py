@@ -151,50 +151,34 @@ def sync(garnet, snapshot, dry_run=True):
         for key, data_baru in kumpulan.items():
             tipe_lama = garnet.type(key)
             data_lama = None
-
             if tipe_lama == jenis:
                 if jenis == "hash":
                     data_lama = garnet.hgetall(key)
-
                 elif jenis == "set":
                     data_lama = garnet.smembers(key)
-
                 else:
                     data_lama = dict(garnet.zrange(key, 0, -1, withscores=True))
-
             if data_lama == data_baru:
                 continue
-
             berubah += 1
-
             if dry_run:
                 continue
-
             # Ganti seluruh isi key agar anggota/field lama hilang.
             garnet.delete(key)
-
             if jenis == "hash":
                 garnet.hset(key, mapping=data_baru)
-
             elif jenis == "set":
                 garnet.sadd(key, *data_baru)
-
             else:
                 garnet.zadd(key, mapping=data_baru)
 
     # Bersihkan key yang tidak lagi dihasilkan oleh RavenDB.
     key_usang = key_lama - snapshot.keys
-
     if not dry_run:
         daftar_usang = sorted(key_usang)
-
         for offset in range(0, len(daftar_usang), 500):
-            garnet.delete(
-                *daftar_usang[offset:offset + 500]
-            )
-
+            garnet.delete(*daftar_usang[offset:offset + 500])
     label = "Rencana" if dry_run else "Selesai"
-
     print(f"{label}: {berubah} key ditambah/diganti, \n {len(key_usang)} key dihapus.")
 
 def validate_data(garnet, snapshot):
